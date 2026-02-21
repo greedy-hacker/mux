@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# mux — Multi-repo AI session multiplexer
+# Uses OverlayFS + bind mounts for parallel, isolated agent sessions.
+# sudo is used internally for mount/umount only.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+info() { echo -e "${GREEN}>>>${NC} $*"; }
+warn() { echo -e "${YELLOW}WARN:${NC} $*"; }
+
+# No global root requirement — sudo is used only for mount/umount.
+
+# ─── Config helpers ──────────────────────────────────────────────────────────
+# Config format: simple line-based file (not JSON, for pure-bash simplicity)
+#   WORKSPACE=<path>
+#   REPO=<name>|<abs_path>
+#   SESSION=<id>
+#   ACTIVE_VIEW=<origin|session_id>
+
+config_dir() {
+    echo "${MUX_WORKSPACE}/.mux"
+}
+
+config_file() {
+    echo "$(config_dir)/config"
+}
+
+ensure_config() {
+    local cf
+    cf="$(config_file)"
+    [[ -f "$cf" ]] || die "Not initialized. Run 'mux init' first."
+}
+
+load_repos() {
+    # Outputs lines: <name>|<path>
+    grep '^REPO=' "$(config_file)" | sed 's/^REPO=//' || true
+}
+
+load_sessions() {
+    grep '^SESSION=' "$(config_file)" | sed 's/^SESSION=//' || true
+}
+
+load_active_view() {
+    grep '^ACTIVE_VIEW=' "$(config_file)" | tail -1 | sed 's/^ACTIVE_VIEW=//' || echo "origin"
+}
+
+load_workspace() {
+    grep '^WORKSPACE=' "$(config_file)" | tail -1 | sed 's/^WORKSPACE=//'
+}
+
+set_active_view() {
+    local cf view="$1"
+    cf="$(config_file)"
+    if grep -q '^ACTIVE_VIEW=' "$cf" 2>/dev/null; then
+        sed -i "s|^ACTIVE_VIEW=.*|ACTIVE_VIEW=${view}|" "$cf"
+    else
+        echo "ACTIVE_VIEW=${view}" >> "$cf"
+    fi
+}
+
+add_session() {
+    local cf="$(config_file)" id="$1"
+    if ! grep -q "^SESSION=${id}$" "$cf" 2>/dev/null; then
+        echo "SESSION=${id}" >> "$cf"
+    fi
+}
+
+is_mounted() {
+    sudo findmnt -rn "$1" >/dev/null 2>&1
+}
+
+# Derive a short name from an absolute path for session storage.
+# e.g., /home/user/project/a → a
+repo_basename() {
+    basename "$1"
+}
+
+# ─── Subcommands ─────────────────────────────────────────────────────────────
+
+cmd_init() {
+    local workspace="" repos_csv=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -w|--workspace) workspace="$2"; shift 2 ;;
+            -r|--repos)     repos_csv="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    [[ -n "$workspace" ]] || die "Usage: mux init -w <workspace_dir> -r <path1>,<path2>,..."
+    [[ -n "$repos_csv" ]] || die "Usage: mux init -w <workspace_dir> -r <path1>,<path2>,..."
+
+    # Resolve workspace to absolute path
+    workspace="$(cd "$workspace" 2>/dev/null && pwd)" || die "Workspace dir does not exist: $workspace"
+    export MUX_WORKSPACE="$workspace"
+
+    # Parse repos
+    IFS=',' read -ra repo_paths <<< "$repos_csv"
+    [[ ${#repo_paths[@]} -gt 0 ]] || die "No repos specified."
+
+    # Validate repos
+    for rp in "${repo_paths[@]}"; do
+        local abs_path
+        abs_path="$(cd "$rp" 2>/dev/null && pwd)" || die "Repo path does not exist: $rp"
+        repo_paths_abs+=("$abs_path")
+    done
+
+    # Create config dir
+    mkdir -p "$(config_dir)/sessions"
+
+    # Write config
+    local cf
+    cf="$(config_file)"
+    echo "WORKSPACE=${workspace}" > "$cf"
+    for abs_path in "${repo_paths_abs[@]}"; do
+        local name
+        name="$(repo_basename "$abs_path")"
+        echo "REPO=${name}|${abs_path}" >> "$cf"
+    done
+    echo "ACTIVE_VIEW=origin" >> "$cf"
+
+    info "Initialized mux workspace at ${CYAN}${workspace}${NC}"
+    info "Registered repos:"
+    for abs_path in "${repo_paths_abs[@]}"; do
+        echo "    $(repo_basename "$abs_path") → ${abs_path}"
+    done
+}
+
+cmd_create() {
+    local session_id="${1:-}"
+    [[ -n "$session_id" ]] || die "Usage: mux create <session_id>"
+    ensure_config
+
+    local ws
+    ws="$(load_workspace)"
+    local sess_dir="${ws}/.mux/sessions/${session_id}"
+
+    # Check if session already exists
+    if grep -q "^SESSION=${session_id}$" "$(config_file)" 2>/dev/null; then
+        warn "Session '${session_id}' already registered. Re-mounting."
+    fi
+
+    info "Creating session ${BOLD}${session_id}${NC}"
+
+    while IFS='|' read -r name repo_path; do
+        local upper="${sess_dir}/${name}/upper"
+        local work="${sess_dir}/${name}/work"
+        local agent_view="${repo_path}_${session_id}"
+
+        # Create session storage
+        mkdir -p "$upper" "$work"
+
+        # Create agent view directory
+        mkdir -p "$agent_view"
+
+        # Mount overlay if not already mounted
+        if is_mounted "$agent_view"; then
+            info "  ${name}_${session_id}: already mounted, skipping"
+        else
+            sudo mount -t overlay overlay \
+                -o "lowerdir=${repo_path},upperdir=${upper},workdir=${work}" \
+                "$agent_view"
+            info "  ${name}_${session_id}: overlay mounted at ${CYAN}${agent_view}${NC}"
+        fi
+    done < <(load_repos)
+
+    add_session "$session_id"
+    info "Session ${BOLD}${session_id}${NC} ready."
+}
+
+cmd_switch() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || die "Usage: mux switch <session_id | origin>"
+    ensure_config
+
+    local current_view
+    current_view="$(load_active_view)"
+
+    # First, unmount any existing compiler-view bind mounts
+    if [[ "$current_view" != "origin" ]]; then
+        info "Unmounting current compiler view (session ${current_view})..."
+        while IFS='|' read -r name repo_path; do
+            if is_mounted "$repo_path"; then
+                sudo umount "$repo_path"
+                info "  ${name}: unmounted ${repo_path}"
+            fi
+        done < <(load_repos)
+    fi
+
+    if [[ "$target" == "origin" ]]; then
+        # Origin: just unmount — original content wakes up
+        set_active_view "origin"
+        info "Compiler view: ${BOLD}origin${NC} (original repos visible)"
+    else
+        # Verify session exists
+        if ! grep -q "^SESSION=${target}$" "$(config_file)" 2>/dev/null; then
+            die "Session '${target}' does not exist. Run 'mux create ${target}' first."
+        fi
+
+        info "Switching compiler view to session ${BOLD}${target}${NC}..."
+        while IFS='|' read -r name repo_path; do
+            local agent_view="${repo_path}_${target}"
+            if ! is_mounted "$agent_view"; then
+                warn "${name}_${target} overlay not mounted. Run 'mux remount ${target}'."
+                continue
+            fi
+            sudo mount --bind "$agent_view" "$repo_path"
+            info "  ${name}: ${repo_path} → session ${target}"
+        done < <(load_repos)
+
+        set_active_view "$target"
+        info "Compiler view: session ${BOLD}${target}${NC}"
+    fi
+}
+
+cmd_status() {
+    ensure_config
+
+    local ws
+    ws="$(load_workspace)"
+    local active
+    active="$(load_active_view)"
+
+    echo -e "${BOLD}mux status${NC}"
+    echo -e "  Workspace:     ${CYAN}${ws}${NC}"
+    echo -e "  Compiler view: ${BOLD}${active}${NC}"
+    echo ""
+
+    echo -e "${BOLD}Repos:${NC}"
+    while IFS='|' read -r name repo_path; do
+        local mount_info=""
+        if is_mounted "$repo_path"; then
+            mount_info="${GREEN}[bind-mounted]${NC}"
+        else
+            mount_info="${CYAN}[origin]${NC}"
+        fi
+        echo -e "  ${name}  ${repo_path}  ${mount_info}"
+    done < <(load_repos)
+    echo ""
+
+    echo -e "${BOLD}Sessions:${NC}"
+    local sessions
+    sessions="$(load_sessions)"
+    if [[ -z "$sessions" ]]; then
+        echo "  (none)"
+    else
+        while read -r sid; do
+            echo -n "  Session ${BOLD}${sid}${NC}: "
+            local all_mounted=true
+            while IFS='|' read -r name repo_path; do
+                local agent_view="${repo_path}_${sid}"
+                if ! is_mounted "$agent_view"; then
+                    all_mounted=false
+                    break
+                fi
+            done < <(load_repos)
+            if $all_mounted; then
+                echo -e "${GREEN}mounted${NC}"
+            else
+                echo -e "${YELLOW}not mounted${NC} (run 'mux remount ${sid}')"
+            fi
+        done <<< "$sessions"
+    fi
+}
+
+cmd_remount() {
+    local target_session="${1:-}"
+    ensure_config
+
+    local ws
+    ws="$(load_workspace)"
+
+    # Determine which sessions to remount
+    local sessions_to_mount=()
+    if [[ -n "$target_session" ]]; then
+        if ! grep -q "^SESSION=${target_session}$" "$(config_file)" 2>/dev/null; then
+            die "Session '${target_session}' not found in config."
+        fi
+        sessions_to_mount=("$target_session")
+    else
+        while read -r sid; do
+            [[ -n "$sid" ]] && sessions_to_mount+=("$sid")
+        done < <(load_sessions)
+    fi
+
+    # Remount session overlays
+    for sid in "${sessions_to_mount[@]}"; do
+        info "Remounting session ${BOLD}${sid}${NC}..."
+        while IFS='|' read -r name repo_path; do
+            local upper="${ws}/.mux/sessions/${sid}/${name}/upper"
+            local work="${ws}/.mux/sessions/${sid}/${name}/work"
+            local agent_view="${repo_path}_${sid}"
+
+            if is_mounted "$agent_view"; then
+                info "  ${name}_${sid}: already mounted"
+                continue
+            fi
+
+            if [[ ! -d "$upper" ]]; then
+                warn "  ${name}_${sid}: session storage missing, skipping"
+                continue
+            fi
+
+            mkdir -p "$agent_view"
+            sudo mount -t overlay overlay \
+                -o "lowerdir=${repo_path},upperdir=${upper},workdir=${work}" \
+                "$agent_view"
+            info "  ${name}_${sid}: overlay re-mounted"
+        done < <(load_repos)
+    done
+
+    # Restore compiler view
+    local active
+    active="$(load_active_view)"
+    if [[ "$active" != "origin" ]]; then
+        info "Restoring compiler view to session ${BOLD}${active}${NC}..."
+        while IFS='|' read -r name repo_path; do
+            local agent_view="${repo_path}_${active}"
+            if is_mounted "$repo_path"; then
+                info "  ${name}: compiler view already mounted"
+                continue
+            fi
+            if is_mounted "$agent_view"; then
+                sudo mount --bind "$agent_view" "$repo_path"
+                info "  ${name}: compiler view restored"
+            else
+                warn "  ${name}: agent view not mounted, cannot bind"
+            fi
+        done < <(load_repos)
+    else
+        info "Compiler view is origin — no bind mounts needed."
+    fi
+
+    info "Remount complete."
+}
+
+cmd_help() {
+    cat <<'EOF'
+mux — Multi-repo AI session multiplexer
+
+USAGE:
+    mux init     -w <workspace> -r <path1>,<path2>,...
+    mux create   <session_id>
+    mux switch   <session_id | origin>
+    mux status
+    mux remount  [session_id]
+    mux help
+
+SUBCOMMANDS:
+    init      Register workspace and repos. No files are moved or copied.
+    create    Create a new agent session with OverlayFS isolation.
+    switch    Switch compiler view to a session or back to origin.
+    status    Show repos, sessions, and mount states.
+    remount   Re-mount sessions after reboot (all or specific).
+    help      Show this help message.
+
+HOW IT WORKS:
+    - Original repos stay at their paths (never moved/copied).
+    - 'create' mounts an OverlayFS for each repo, using the original as the
+      read-only lower layer. All agent edits go to a CoW upper dir.
+    - 'switch' bind-mounts an agent view over the original path so the
+      compiler sees that session's files at the canonical path.
+    - 'switch origin' unmounts the bind mount, restoring the original.
+
+MANUAL TEARDOWN:
+    # Destroy a session (after switching away from it):
+    sudo umount /path/to/a_1 /path/to/b_1       # overlay agent views
+    sudo rm -rf <workspace>/.mux/sessions/1      # session storage
+    sudo rmdir /path/to/a_1 /path/to/b_1         # agent view dirs
+    # Then remove SESSION=1 line from <workspace>/.mux/config
+
+    # Full cleanup:
+    sudo mux switch origin                        # restore originals
+    # Destroy all sessions as above
+    sudo rm -rf <workspace>/.mux                  # remove mux data
+EOF
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+    # sudo is used internally for mount/umount only
+
+    local cmd="${1:-help}"
+    shift || true
+
+    # Discover workspace: use MUX_WORKSPACE env, or find .mux/ in cwd or parents
+    if [[ -z "${MUX_WORKSPACE:-}" ]]; then
+        local search_dir="$PWD"
+        while [[ "$search_dir" != "/" ]]; do
+            if [[ -d "${search_dir}/.mux" ]]; then
+                export MUX_WORKSPACE="$search_dir"
+                break
+            fi
+            search_dir="$(dirname "$search_dir")"
+        done
+    fi
+
+    case "$cmd" in
+        init)     cmd_init "$@" ;;
+        create)   cmd_create "$@" ;;
+        switch)   cmd_switch "$@" ;;
+        status)   cmd_status "$@" ;;
+        remount)  cmd_remount "$@" ;;
+        help|--help|-h) cmd_help ;;
+        version|--version|-v) echo "mux v${VERSION}" ;;
+        *)        die "Unknown command: $cmd. Run 'mux help' for usage." ;;
+    esac
+}
+
+main "$@"
