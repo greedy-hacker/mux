@@ -432,6 +432,127 @@ cmd_delete() {
     info "Session ${BOLD}${session_id}${NC} deleted."
 }
 
+cmd_destroy() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force) force=true; shift ;;
+            *) die "Unknown option: $1. Usage: mux destroy [-f|--force]" ;;
+        esac
+    done
+
+    # Allow destroy even if config is partially broken
+    local cf
+    cf="$(config_file)" 2>/dev/null || true
+    if [[ ! -f "$cf" ]]; then
+        warn "No config found at $(config_dir)/config. Nothing to destroy."
+        return 0
+    fi
+
+    local ws
+    ws="$(load_workspace)"
+    local errors=0
+
+    info "${RED}Destroying workspace ${CYAN}${ws}${NC}..."
+    echo ""
+
+    # ── Phase 1: Unmount compiler view ──
+    local active
+    active="$(load_active_view)"
+    if [[ "$active" != "origin" ]]; then
+        info "Phase 1: Unmounting compiler view (session ${active})..."
+        while IFS='|' read -r name repo_path; do
+            if is_mounted "$repo_path"; then
+                if sudo umount "$repo_path" 2>/dev/null; then
+                    info "  ${name}: compiler view unmounted"
+                elif $force; then
+                    warn "  ${name}: busy, force-unmounting (lazy)..."
+                    sudo umount -l "$repo_path" 2>/dev/null || { warn "  ${name}: lazy umount failed"; (( ++errors )); }
+                else
+                    warn "  ${name}: device busy at ${repo_path}. Use --force for lazy umount."
+                    (( ++errors ))
+                fi
+            fi
+        done < <(load_repos)
+    else
+        info "Phase 1: Compiler view is origin — nothing to unmount."
+    fi
+    echo ""
+
+    # ── Phase 2: Unmount session overlays + remove agent view dirs ──
+    info "Phase 2: Unmounting session overlays..."
+    local sessions
+    sessions="$(load_sessions)"
+    if [[ -n "$sessions" ]]; then
+        while read -r sid; do
+            [[ -n "$sid" ]] || continue
+            while IFS='|' read -r name repo_path; do
+                local agent_view="${repo_path}_${sid}"
+                # Unmount overlay
+                if is_mounted "$agent_view"; then
+                    if sudo umount "$agent_view" 2>/dev/null; then
+                        info "  ${name}_${sid}: overlay unmounted"
+                    elif $force; then
+                        warn "  ${name}_${sid}: busy, force-unmounting (lazy)..."
+                        sudo umount -l "$agent_view" 2>/dev/null || { warn "  ${name}_${sid}: lazy umount failed"; (( ++errors )); }
+                    else
+                        warn "  ${name}_${sid}: device busy. Use --force for lazy umount."
+                        (( ++errors ))
+                    fi
+                fi
+                # Remove agent view dir
+                if [[ -d "$agent_view" ]]; then
+                    if sudo rmdir "$agent_view" 2>/dev/null; then
+                        info "  ${name}_${sid}: agent view dir removed"
+                    elif $force; then
+                        sudo rm -rf "$agent_view" 2>/dev/null || true
+                        info "  ${name}_${sid}: agent view dir force-removed"
+                    else
+                        warn "  ${name}_${sid}: dir not empty (still mounted?). Use --force."
+                        (( ++errors ))
+                    fi
+                fi
+            done < <(load_repos)
+        done <<< "$sessions"
+    else
+        info "  No sessions found."
+    fi
+    echo ""
+
+    # ── Phase 3: Unmount origin references ──
+    info "Phase 3: Unmounting origin references..."
+    while IFS='|' read -r name repo_path; do
+        local origin_ref="${ws}/.mux/origins/${name}"
+        if is_mounted "$origin_ref"; then
+            if sudo umount "$origin_ref" 2>/dev/null; then
+                info "  ${name}: origin ref unmounted"
+            elif $force; then
+                sudo umount -l "$origin_ref" 2>/dev/null || true
+                info "  ${name}: origin ref force-unmounted"
+            else
+                warn "  ${name}: origin ref busy. Use --force."
+                (( ++errors ))
+            fi
+        else
+            info "  ${name}: origin ref not mounted (skipping)"
+        fi
+    done < <(load_repos)
+    echo ""
+
+    # ── Phase 4: Remove .mux directory ──
+    if [[ $errors -eq 0 ]] || $force; then
+        info "Phase 4: Removing mux data..."
+        if [[ -d "${ws}/.mux" ]]; then
+            sudo rm -rf "${ws}/.mux"
+            info "  ${ws}/.mux removed."
+        fi
+        info "${GREEN}Workspace destroyed.${NC}"
+    else
+        warn "Phase 4: Skipping .mux removal due to ${errors} error(s)."
+        warn "Fix busy mounts and re-run, or use: mux destroy --force"
+    fi
+}
+
 cmd_help() {
     cat <<'EOF'
 mux — Multi-repo AI session multiplexer
@@ -439,9 +560,11 @@ mux — Multi-repo AI session multiplexer
 USAGE:
     mux init     -w <workspace> -r <path1>,<path2>,...
     mux create   <session_id>
+    mux delete   <session_id>
     mux switch   <session_id | origin>
     mux status
     mux remount  [session_id]
+    mux destroy  [-f|--force]
     mux help
 
 SUBCOMMANDS:
@@ -451,6 +574,7 @@ SUBCOMMANDS:
     switch    Switch compiler view to a session or back to origin.
     status    Show repos, sessions, and mount states.
     remount   Re-mount sessions after reboot (all or specific).
+    destroy   Tear down entire workspace: unmount everything, remove data.
     help      Show this help message.
 
 HOW IT WORKS:
@@ -499,6 +623,7 @@ main() {
         init)     cmd_init "$@" ;;
         create)   cmd_create "$@" ;;
         delete)   cmd_delete "$@" ;;
+        destroy)  cmd_destroy "$@" ;;
         switch)   cmd_switch "$@" ;;
         status)   cmd_status "$@" ;;
         remount)  cmd_remount "$@" ;;

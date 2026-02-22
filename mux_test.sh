@@ -659,6 +659,55 @@ test_22_delete_switched_session() {
     echo ""
 }
 
+test_23_destroy_workspace() {
+    echo -e "${BOLD}Test 23: destroy entire workspace${NC}"
+
+    # Switch to session 1 to test that destroy handles active compiler view
+    "$MUX" switch 1
+
+    "$MUX" destroy
+
+    # All session overlays gone
+    assert_not_mounted "a_1 unmounted after destroy" "${REPO_A}_1"
+    assert_not_mounted "a_2 unmounted after destroy" "${REPO_A}_2"
+    assert_not_mounted "b_1 unmounted after destroy" "${REPO_B}_1"
+
+    # Agent view dirs gone
+    assert_file_not_exists "a_1 dir removed" "${REPO_A}_1"
+    assert_file_not_exists "a_2 dir removed" "${REPO_A}_2"
+
+    # Compiler view unmounted (origin visible)
+    assert_not_mounted "compiler view unmounted" "${REPO_A}"
+    assert_eq "origin content restored" "original_a" "$(cat "${REPO_A}/file_a.txt")"
+
+    # Origin refs gone
+    assert_not_mounted "origin ref a unmounted" "${WORKSPACE}/.mux/origins/a"
+
+    # .mux directory gone
+    assert_file_not_exists ".mux removed" "${WORKSPACE}/.mux"
+
+    echo ""
+}
+
+test_24_destroy_no_config() {
+    echo -e "${BOLD}Test 24: destroy with no config (edge case)${NC}"
+
+    # Use a fresh temp dir with no .mux config
+    local tmpdir
+    tmpdir="$(mktemp -d /tmp/mux_no_config.XXXXXX)"
+    local output
+    # Should not fail, just warn
+    if output="$(MUX_WORKSPACE="$tmpdir" "$MUX" destroy 2>&1)"; then
+        echo -e "  ${GREEN}✓${NC} destroy with no config exits gracefully"
+        (( ++PASS ))
+    else
+        echo -e "  ${RED}✗${NC} destroy with no config should not fail"
+        (( ++FAIL ))
+    fi
+    rm -rf "$tmpdir"
+    echo ""
+}
+
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -702,6 +751,10 @@ main() {
     # Delete tests
     test_21_delete_session
     test_22_delete_switched_session
+
+    # Destroy tests (must be last — tears down workspace)
+    test_23_destroy_workspace
+    test_24_destroy_no_config
 
     echo -e "${BOLD}═══════════════════════════════════════${NC}"
     echo -e "  ${GREEN}Passed: ${PASS}${NC}  ${RED}Failed: ${FAIL}${NC}"

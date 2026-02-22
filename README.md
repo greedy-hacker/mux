@@ -65,6 +65,7 @@ make -C /path/to/a
 | `mux switch <id\|origin>` | Bind-mount session to compiler paths, or unmount for origin. |
 | `mux status` | Show repos, sessions, mount states. |
 | `mux remount [id]` | Re-mount sessions after reboot. |
+| `mux destroy [-f]` | Tear down entire workspace. `--force` for busy mounts. |
 | `mux help` | Usage and manual teardown instructions. |
 
 ## Manual Teardown
@@ -103,7 +104,7 @@ sudo rmdir /path/to/a_1 /path/to/b_1
 ./mux_test.sh    # prompts for sudo password
 ```
 
-111 assertions across 22 tests covering isolation, git CoW, compiler view switching, remount, create-while-switched, session deletion, error handling, and a full multi-repo workflow simulation.
+121 assertions across 24 tests covering isolation, git CoW, compiler view switching, remount, create-while-switched, session deletion, workspace destruction, error handling, and a full multi-repo workflow simulation.
 
 ---
 
