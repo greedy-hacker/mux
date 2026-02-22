@@ -133,6 +133,20 @@ cmd_init() {
     done
     echo "ACTIVE_VIEW=origin" >> "$cf"
 
+    # Create stable origin reference mounts (private, never affected by switch)
+    info "Creating origin reference mounts..."
+    for abs_path in "${repo_paths_abs[@]}"; do
+        local name origin_ref
+        name="$(repo_basename "$abs_path")"
+        origin_ref="$(config_dir)/origins/${name}"
+        mkdir -p "$origin_ref"
+        if ! is_mounted "$origin_ref"; then
+            sudo mount --bind "$abs_path" "$origin_ref"
+            sudo mount --make-private "$origin_ref"
+            info "  ${name}: origin ref at ${CYAN}${origin_ref}${NC}"
+        fi
+    done
+
     info "Initialized mux workspace at ${CYAN}${workspace}${NC}"
     info "Registered repos:"
     for abs_path in "${repo_paths_abs[@]}"; do
@@ -171,8 +185,12 @@ cmd_create() {
         if is_mounted "$agent_view"; then
             info "  ${name}_${session_id}: already mounted, skipping"
         else
+            local origin_ref="${ws}/.mux/origins/${name}"
+            if ! is_mounted "$origin_ref"; then
+                die "Origin reference for '${name}' not mounted. Run 'mux remount' first."
+            fi
             sudo mount -t overlay overlay \
-                -o "lowerdir=${repo_path},upperdir=${upper},workdir=${work}" \
+                -o "lowerdir=${origin_ref},upperdir=${upper},workdir=${work}" \
                 "$agent_view"
             info "  ${name}_${session_id}: overlay mounted at ${CYAN}${agent_view}${NC}"
         fi
@@ -297,6 +315,20 @@ cmd_remount() {
         done < <(load_sessions)
     fi
 
+    # Remount origin references first (lost after reboot)
+    info "Restoring origin reference mounts..."
+    while IFS='|' read -r name repo_path; do
+        local origin_ref="${ws}/.mux/origins/${name}"
+        if ! is_mounted "$origin_ref"; then
+            mkdir -p "$origin_ref"
+            sudo mount --bind "$repo_path" "$origin_ref"
+            sudo mount --make-private "$origin_ref"
+            info "  ${name}: origin ref restored"
+        else
+            info "  ${name}: origin ref already mounted"
+        fi
+    done < <(load_repos)
+
     # Remount session overlays
     for sid in "${sessions_to_mount[@]}"; do
         info "Remounting session ${BOLD}${sid}${NC}..."
@@ -315,9 +347,10 @@ cmd_remount() {
                 continue
             fi
 
+            local origin_ref="${ws}/.mux/origins/${name}"
             mkdir -p "$agent_view"
             sudo mount -t overlay overlay \
-                -o "lowerdir=${repo_path},upperdir=${upper},workdir=${work}" \
+                -o "lowerdir=${origin_ref},upperdir=${upper},workdir=${work}" \
                 "$agent_view"
             info "  ${name}_${sid}: overlay re-mounted"
         done < <(load_repos)
@@ -348,6 +381,57 @@ cmd_remount() {
     info "Remount complete."
 }
 
+cmd_delete() {
+    local session_id="${1:-}"
+    [[ -n "$session_id" ]] || die "Usage: mux delete <session_id>"
+    ensure_config
+
+    local cf
+    cf="$(config_file)"
+
+    # Verify session exists
+    if ! grep -q "^SESSION=${session_id}$" "$cf" 2>/dev/null; then
+        die "Session '${session_id}' does not exist."
+    fi
+
+    # Refuse to delete the currently switched-in session
+    local active
+    active="$(load_active_view)"
+    if [[ "$active" == "$session_id" ]]; then
+        die "Session '${session_id}' is currently switched in. Run 'mux switch origin' or 'mux switch <other>' first."
+    fi
+
+    local ws
+    ws="$(load_workspace)"
+
+    info "Deleting session ${BOLD}${session_id}${NC}..."
+
+    # Unmount overlay agent views and remove directories
+    while IFS='|' read -r name repo_path; do
+        local agent_view="${repo_path}_${session_id}"
+        if is_mounted "$agent_view"; then
+            sudo umount "$agent_view"
+            info "  ${name}_${session_id}: overlay unmounted"
+        fi
+        if [[ -d "$agent_view" ]]; then
+            sudo rmdir "$agent_view" 2>/dev/null || sudo rm -rf "$agent_view"
+            info "  ${name}_${session_id}: agent view removed"
+        fi
+    done < <(load_repos)
+
+    # Remove session storage
+    local sess_dir="${ws}/.mux/sessions/${session_id}"
+    if [[ -d "$sess_dir" ]]; then
+        sudo rm -rf "$sess_dir"
+        info "  Session storage removed: ${sess_dir}"
+    fi
+
+    # Remove session from config
+    sed -i "/^SESSION=${session_id}$/d" "$cf"
+
+    info "Session ${BOLD}${session_id}${NC} deleted."
+}
+
 cmd_help() {
     cat <<'EOF'
 mux — Multi-repo AI session multiplexer
@@ -363,6 +447,7 @@ USAGE:
 SUBCOMMANDS:
     init      Register workspace and repos. No files are moved or copied.
     create    Create a new agent session with OverlayFS isolation.
+    delete    Delete a session: unmount overlays, remove storage.
     switch    Switch compiler view to a session or back to origin.
     status    Show repos, sessions, and mount states.
     remount   Re-mount sessions after reboot (all or specific).
@@ -413,6 +498,7 @@ main() {
     case "$cmd" in
         init)     cmd_init "$@" ;;
         create)   cmd_create "$@" ;;
+        delete)   cmd_delete "$@" ;;
         switch)   cmd_switch "$@" ;;
         status)   cmd_status "$@" ;;
         remount)  cmd_remount "$@" ;;

@@ -75,12 +75,22 @@ cleanup() {
     done
     # Also try unmounting known paths
     for path in "${REPO_A:-}" "${REPO_B:-}" "${REPO_C:-}" \
-                "${REPO_A:-}_1" "${REPO_A:-}_2" "${REPO_B:-}_1" "${REPO_B:-}_2" \
-                "${REPO_C:-}_1" "${REPO_C:-}_2" "${REPO_C:-}_agent1" "${REPO_C:-}_agent2"; do
+                "${REPO_A:-}_1" "${REPO_A:-}_2" "${REPO_A:-}_3" \
+                "${REPO_B:-}_1" "${REPO_B:-}_2" "${REPO_B:-}_3" \
+                "${REPO_C:-}_1" "${REPO_C:-}_2" "${REPO_C:-}_3" \
+                "${REPO_C:-}_agent1" "${REPO_C:-}_agent2"; do
         if [[ -n "$path" ]] && sudo findmnt -rn "$path" >/dev/null 2>&1; then
             sudo umount "$path" 2>/dev/null || true
         fi
     done
+    # Unmount origin references
+    if [[ -n "${WORKSPACE:-}" && -d "${WORKSPACE}/.mux/origins" ]]; then
+        for origin_dir in "${WORKSPACE}/.mux/origins"/*/; do
+            if [[ -d "$origin_dir" ]] && sudo findmnt -rn "$origin_dir" >/dev/null 2>&1; then
+                sudo umount "$origin_dir" 2>/dev/null || true
+            fi
+        done
+    fi
     if [[ -n "$TMPBASE" && -d "$TMPBASE" ]]; then
         rm -rf "$TMPBASE"
     fi
@@ -558,6 +568,97 @@ test_19_full_antigravity_workflow() {
     echo ""
 }
 
+test_20_create_while_switched() {
+    echo -e "${BOLD}Test 20: create session while another is switched in${NC}"
+
+    # Switch to session 1 (compiler view shows session 1)
+    "$MUX" switch 1
+    MOUNTS_CREATED+=("${REPO_A}" "${REPO_B}" "${REPO_C}")
+
+    # Write a unique file in session 1's agent view
+    echo "session_1_unique" > "${REPO_A}_1/switched_marker.txt"
+
+    # Verify compiler view sees session 1's content
+    assert_file_exists "compiler view sees session 1 marker" "${REPO_A}/switched_marker.txt"
+
+    # Create session 3 WHILE session 1 is switched in
+    "$MUX" create 3
+    MOUNTS_CREATED+=("${REPO_A}_3" "${REPO_B}_3" "${REPO_C}_3")
+
+    # Session 3 must NOT contain session 1's file (must fork from origin)
+    assert_file_not_exists "session 3 does NOT have session 1 marker" "${REPO_A}_3/switched_marker.txt"
+
+    # Session 3 must have original content (forked from origin)
+    assert_eq "session 3 has origin content" "original_a" "$(cat "${REPO_A}_3/file_a.txt")"
+
+    # Compiler view must still be on session 1 (undisturbed)
+    assert_file_exists "compiler view still has session 1 marker" "${REPO_A}/switched_marker.txt"
+    local active_view
+    active_view="$(grep '^ACTIVE_VIEW=' "${WORKSPACE}/.mux/config" | sed 's/ACTIVE_VIEW=//')"
+    assert_eq "active view still session 1" "1" "$active_view"
+
+    "$MUX" switch origin
+    echo ""
+}
+
+test_21_delete_session() {
+    echo -e "${BOLD}Test 21: delete a session${NC}"
+
+    # Session 3 was created in test 20 — delete it
+    "$MUX" delete 3
+
+    # Verify overlays unmounted
+    assert_not_mounted "a_3 unmounted after delete" "${REPO_A}_3"
+    assert_not_mounted "b_3 unmounted after delete" "${REPO_B}_3"
+    assert_not_mounted "c_3 unmounted after delete" "${REPO_C}_3"
+
+    # Verify agent view dirs removed
+    assert_file_not_exists "a_3 dir removed" "${REPO_A}_3"
+    assert_file_not_exists "b_3 dir removed" "${REPO_B}_3"
+    assert_file_not_exists "c_3 dir removed" "${REPO_C}_3"
+
+    # Verify session storage removed
+    assert_file_not_exists "session 3 storage removed" "${WORKSPACE}/.mux/sessions/3"
+
+    # Verify session removed from config
+    if grep -q '^SESSION=3$' "${WORKSPACE}/.mux/config" 2>/dev/null; then
+        echo -e "  ${RED}✗${NC} session 3 still in config"
+        (( ++FAIL ))
+    else
+        echo -e "  ${GREEN}✓${NC} session 3 removed from config"
+        (( ++PASS ))
+    fi
+
+    # Verify other sessions still intact
+    assert_mounted "a_1 still mounted" "${REPO_A}_1"
+    assert_mounted "a_2 still mounted" "${REPO_A}_2"
+    assert_file_exists "session 1 data intact" "${REPO_A}_1/only_in_1.txt"
+    assert_file_exists "session 2 data intact" "${REPO_A}_2/only_in_2.txt"
+    echo ""
+}
+
+test_22_delete_switched_session() {
+    echo -e "${BOLD}Test 22: delete currently switched session (error case)${NC}"
+
+    "$MUX" switch 1
+    MOUNTS_CREATED+=("${REPO_A}" "${REPO_B}" "${REPO_C}")
+
+    local output
+    if output="$("$MUX" delete 1 2>&1)"; then
+        echo -e "  ${RED}\u2717${NC} should have failed but succeeded"
+        (( ++FAIL ))
+    else
+        echo -e "  ${GREEN}\u2713${NC} correctly refused: delete switched session"
+        (( ++PASS ))
+    fi
+
+    # Verify session 1 is still intact
+    assert_mounted "a_1 still mounted after refused delete" "${REPO_A}_1"
+
+    "$MUX" switch origin
+    echo ""
+}
+
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -594,6 +695,13 @@ main() {
 
     # End-to-end workflow
     test_19_full_antigravity_workflow
+
+    # Origin reference tests
+    test_20_create_while_switched
+
+    # Delete tests
+    test_21_delete_session
+    test_22_delete_switched_session
 
     echo -e "${BOLD}═══════════════════════════════════════${NC}"
     echo -e "  ${GREEN}Passed: ${PASS}${NC}  ${RED}Failed: ${FAIL}${NC}"

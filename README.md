@@ -48,6 +48,9 @@ make -C /path/to/a
 # Check state
 ./mux status
 
+# Delete a session
+./mux delete 2       # unmounts overlays, removes storage
+
 # Re-mount after reboot
 ./mux remount        # all sessions, or: ./mux remount 1
 ```
@@ -58,6 +61,7 @@ make -C /path/to/a
 |---------|-------------|
 | `mux init -w <workspace> -r <paths>` | Register workspace and repos. No files moved. |
 | `mux create <id>` | Create session with OverlayFS per repo. |
+| `mux delete <id>` | Delete a session: unmount overlays, remove storage. |
 | `mux switch <id\|origin>` | Bind-mount session to compiler paths, or unmount for origin. |
 | `mux status` | Show repos, sessions, mount states. |
 | `mux remount [id]` | Re-mount sessions after reboot. |
@@ -99,7 +103,7 @@ sudo rmdir /path/to/a_1 /path/to/b_1
 ./mux_test.sh    # prompts for sudo password
 ```
 
-92 assertions across 19 tests covering isolation, git CoW, compiler view switching, remount, error handling, and a full multi-repo workflow simulation.
+111 assertions across 22 tests covering isolation, git CoW, compiler view switching, remount, create-while-switched, session deletion, error handling, and a full multi-repo workflow simulation.
 
 ---
 
